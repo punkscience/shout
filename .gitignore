@@ -22,7 +22,6 @@ go.work
 
 # Environment variables
 .env
-.env.local
 
 # IDE specific files
 .idea/
@@ -33,4 +32,3 @@ go.work
 # OS specific files
 .DS_Store
 Thumbs.db
-
