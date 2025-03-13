@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/joho/godotenv"
 	"github.com/mitchellh/go-homedir"
 )
 
@@ -33,47 +33,6 @@ type BlueskyAuthResponse struct {
 	RefreshJwt string `json:"refreshJwt"`
 	Did        string `json:"did"`
 }
-
-func initConfigs() error {
-	if err := loadEnv(); err != nil {
-		return fmt.Errorf("error loading environment variables: %w", err)
-	}
-
-	// Verify required environment variables
-	required := []string{
-		"BLUESKY_IDENTIFIER",
-		"BLUESKY_APP_PASSWORD",
-	}
-
-	for _, env := range required {
-		if os.Getenv(env) == "" {
-			return fmt.Errorf("required environment variable %s is not set", env)
-		}
-	}
-
-	return nil
-}
-
-func loadEnv() error {
-	// Try to load from .env file
-	if err := godotenv.Load(); err != nil {
-		fmt.Printf("Warning: .env file not found or error loading it: %v\n", err)
-	}
-
-	// Verify required environment variables
-	required := []string{
-		"BLUESKY_IDENTIFIER",
-		"BLUESKY_APP_PASSWORD",
-	}
-	
-	for _, env := range required {
-		if os.Getenv(env) == "" {
-			return fmt.Errorf("required environment variable %s is not set", env)
-		}
-	}
-	return nil
-}
-
 func LoadConfig() (*Config, error) {
 	home, err := homedir.Dir()
 	if err != nil {
@@ -126,10 +85,27 @@ func SaveConfig(config *Config) error {
 	return nil
 }
 
-func authenticateBluesky() error {
-	identifier := os.Getenv("BLUESKY_IDENTIFIER")
-	appPassword := os.Getenv("BLUESKY_APP_PASSWORD")
+func promptForCredentials() (string, string, error) {
+	var identifier, password string
 
+	fmt.Print("Enter your Bluesky identifier (email or handle): ")
+	if _, err := fmt.Scanln(&identifier); err != nil {
+		return "", "", fmt.Errorf("failed to read identifier: %w", err)
+	}
+
+	fmt.Print("Enter your Bluesky app password: ")
+	if _, err := fmt.Scanln(&password); err != nil {
+		return "", "", fmt.Errorf("failed to read password: %w", err)
+	}
+
+	// Clean input by trimming spaces
+	identifier = strings.TrimSpace(identifier)
+	password = strings.TrimSpace(password)
+
+	return identifier, password, nil
+}
+
+func authenticateWithCredentials(identifier, appPassword string) (*BlueskyAuthResponse, error) {
 	// Create session with Bluesky
 	authURL := "https://bsky.social/xrpc/com.atproto.server.createSession"
 	authReqBody, err := json.Marshal(map[string]string{
@@ -137,38 +113,104 @@ func authenticateBluesky() error {
 		"password":   appPassword,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to encode auth request: %w", err)
+		return nil, fmt.Errorf("failed to encode auth request: %w", err)
 	}
 
 	authReq, err := http.NewRequest("POST", authURL, bytes.NewBuffer(authReqBody))
 	if err != nil {
-		return fmt.Errorf("failed to create auth request: %w", err)
+		return nil, fmt.Errorf("failed to create auth request: %w", err)
 	}
 	authReq.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{}
 	authResp, err := client.Do(authReq)
 	if err != nil {
-		return fmt.Errorf("authentication request failed: %w", err)
+		return nil, fmt.Errorf("authentication request failed: %w", err)
 	}
 	defer authResp.Body.Close()
 
 	if authResp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(authResp.Body)
-		return fmt.Errorf("authentication failed: status %d, response: %s", authResp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("authentication failed: status %d, response: %s", authResp.StatusCode, string(bodyBytes))
 	}
 
 	var authResult BlueskyAuthResponse
 	if err := json.NewDecoder(authResp.Body).Decode(&authResult); err != nil {
-		return fmt.Errorf("failed to decode auth response: %w", err)
+		return nil, fmt.Errorf("failed to decode auth response: %w", err)
 	}
 
-	// Save the session
+	return &authResult, nil
+}
+
+func refreshBlueskyToken(refreshJwt string) (*BlueskyAuthResponse, error) {
+	refreshURL := "https://bsky.social/xrpc/com.atproto.server.refreshSession"
+	refreshReq, err := http.NewRequest("POST", refreshURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create refresh request: %w", err)
+	}
+	refreshReq.Header.Set("Authorization", "Bearer "+refreshJwt)
+
+	client := &http.Client{}
+	refreshResp, err := client.Do(refreshReq)
+	if err != nil {
+		return nil, fmt.Errorf("refresh request failed: %w", err)
+	}
+	defer refreshResp.Body.Close()
+
+	if refreshResp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(refreshResp.Body)
+		return nil, fmt.Errorf("token refresh failed: status %d, response: %s", refreshResp.StatusCode, string(bodyBytes))
+	}
+
+	var refreshResult BlueskyAuthResponse
+	if err := json.NewDecoder(refreshResp.Body).Decode(&refreshResult); err != nil {
+		return nil, fmt.Errorf("failed to decode refresh response: %w", err)
+	}
+
+	return &refreshResult, nil
+}
+
+func authenticateBluesky() error {
+	// First check if we have stored tokens
 	config, err := LoadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
+	// If we have a refresh token, try to use it first
+	if config.BlueskySession.RefreshJwt != "" {
+		fmt.Println("Attempting to refresh existing session...")
+		authResult, err := refreshBlueskyToken(config.BlueskySession.RefreshJwt)
+		if err == nil {
+			// Successfully refreshed tokens
+			config.BlueskySession.AccessJwt = authResult.AccessJwt
+			config.BlueskySession.RefreshJwt = authResult.RefreshJwt
+			
+			if err := SaveConfig(config); err != nil {
+				return fmt.Errorf("failed to save refreshed tokens: %w", err)
+			}
+			
+			fmt.Printf("Successfully refreshed session for @%s!\n", config.BlueskySession.Handle)
+			return nil
+		}
+	}
+	
+	fmt.Println("Will try with credentials instead.")
+
+	// Always prompt for credentials
+	fmt.Println("Please enter your Bluesky credentials:")
+	identifier, appPassword, err := promptForCredentials()
+	if err != nil {
+		return fmt.Errorf("error prompting for credentials: %w", err)
+	}
+
+	// Authenticate with provided credentials
+	authResult, err := authenticateWithCredentials(identifier, appPassword)
+	if err != nil {
+		return err
+	}
+
+	// Save the session
 	config.BlueskySession = BlueskySession{
 		AccessJwt:  authResult.AccessJwt,
 		RefreshJwt: authResult.RefreshJwt,
@@ -222,21 +264,43 @@ func PostToBluesky(message string) error {
 	}
 	defer postResp.Body.Close()
 
-	if postResp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(postResp.Body)
-		return fmt.Errorf("post failed: status %d, response: %s", postResp.StatusCode, string(bodyBytes))
+	// Check if the token is expired (status 401)
+	if postResp.StatusCode == http.StatusUnauthorized {
+		fmt.Println("Access token expired. Attempting to refresh...")
+		
+		// Try to refresh the token
+		if config.BlueskySession.RefreshJwt != "" {
+			authResult, err := refreshBlueskyToken(config.BlueskySession.RefreshJwt)
+			if err != nil {
+				return fmt.Errorf("failed to refresh token: %w, please re-authenticate with 'auth bluesky'", err)
+			}
+			
+			// Update the tokens in config
+			config.BlueskySession.AccessJwt = authResult.AccessJwt
+			config.BlueskySession.RefreshJwt = authResult.RefreshJwt
+			
+			// Save the updated tokens
+			if err := SaveConfig(config); err != nil {
+				return fmt.Errorf("failed to save refreshed tokens: %w", err)
+			}
+			
+			// Try posting again with the new token
+			return PostToBluesky(message)
+		}
+		
+		return fmt.Errorf("token expired and no refresh token available, please re-authenticate with 'auth bluesky'")
 	}
 
+	if postResp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(postResp.Body)
+		return fmt.Errorf("posting failed: status %d, response: %s", postResp.StatusCode, string(bodyBytes))
+	}
+	
 	fmt.Println("Successfully posted to Bluesky!")
 	return nil
 }
 
 func main() {
-	if err := initConfigs(); err != nil {
-		fmt.Printf("Error initializing configs: %v\n", err)
-		os.Exit(1)
-	}
-
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: shout <command> [args...]")
 		fmt.Println("Commands:")
