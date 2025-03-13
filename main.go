@@ -10,9 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mitchellh/go-homedir"
 )
+
+// Maximum character count allowed for Bluesky posts
+const BlueskeyCharacterLimit = 300
 
 // Config holds the authentication tokens
 type Config struct {
@@ -227,6 +231,15 @@ func authenticateBluesky() error {
 }
 
 func PostToBluesky(message string) error {
+	// Check message length against the character limit using Unicode character count
+	messageLength := utf8.RuneCountInString(message)
+	fmt.Printf("Your message contains %d characters (limit: %d)\n", messageLength, BlueskeyCharacterLimit)
+	
+	if messageLength > BlueskeyCharacterLimit {
+		remainingCount := messageLength - BlueskeyCharacterLimit
+		return fmt.Errorf("message exceeds Bluesky's %d character limit by %d characters. Your message has %d characters. Please shorten your message", BlueskeyCharacterLimit, remainingCount, messageLength)
+	}
+
 	config, err := LoadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
