@@ -37,7 +37,8 @@ type BlueskyAuthResponse struct {
 	RefreshJwt string `json:"refreshJwt"`
 	Did        string `json:"did"`
 }
-func LoadConfig() (*Config, error) {
+
+func loadConfig() (*Config, error) {
 	home, err := homedir.Dir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
@@ -65,7 +66,7 @@ func LoadConfig() (*Config, error) {
 	return &config, nil
 }
 
-func SaveConfig(config *Config) error {
+func saveConfig(config *Config) error {
 	home, err := homedir.Dir()
 	if err != nil {
 		return fmt.Errorf("failed to get home directory: %w", err)
@@ -176,7 +177,7 @@ func refreshBlueskyToken(refreshJwt string) (*BlueskyAuthResponse, error) {
 
 func authenticateBluesky() error {
 	// First check if we have stored tokens
-	config, err := LoadConfig()
+	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -189,16 +190,16 @@ func authenticateBluesky() error {
 			// Successfully refreshed tokens
 			config.BlueskySession.AccessJwt = authResult.AccessJwt
 			config.BlueskySession.RefreshJwt = authResult.RefreshJwt
-			
-			if err := SaveConfig(config); err != nil {
+
+			if err := saveConfig(config); err != nil {
 				return fmt.Errorf("failed to save refreshed tokens: %w", err)
 			}
-			
+
 			fmt.Printf("Successfully refreshed session for @%s!\n", config.BlueskySession.Handle)
 			return nil
 		}
 	}
-	
+
 	fmt.Println("Will try with credentials instead.")
 
 	// Always prompt for credentials
@@ -222,31 +223,23 @@ func authenticateBluesky() error {
 		Did:        authResult.Did,
 	}
 
-	if err := SaveConfig(config); err != nil {
+	if err := saveConfig(config); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	fmt.Printf("Successfully authenticated with Bluesky as @%s!\n", identifier)
+	fmt.Printf("successfully authenticated with Bluesky as @%s!\n", identifier)
 	return nil
 }
 
 func PostToBluesky(message string) error {
-	// Check message length against the character limit using Unicode character count
-	messageLength := utf8.RuneCountInString(message)
-	fmt.Printf("Your message contains %d characters (limit: %d)\n", messageLength, BlueskeyCharacterLimit)
-	
-	if messageLength > BlueskeyCharacterLimit {
-		remainingCount := messageLength - BlueskeyCharacterLimit
-		return fmt.Errorf("message exceeds Bluesky's %d character limit by %d characters. Your message has %d characters. Please shorten your message", BlueskeyCharacterLimit, remainingCount, messageLength)
-	}
 
-	config, err := LoadConfig()
+	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
 	if config.BlueskySession.AccessJwt == "" {
-		return fmt.Errorf("not authenticated with Bluesky, please run 'auth bluesky' first")
+		return fmt.Errorf("not authenticated with Bluesky, please run 'shout auth bluesky' first")
 	}
 
 	// Create post with Bluesky
@@ -277,30 +270,30 @@ func PostToBluesky(message string) error {
 	}
 	defer postResp.Body.Close()
 
-	// Check if the token is expired (status 401)
-	if postResp.StatusCode == http.StatusUnauthorized {
+	// Check if the token is expired (status 400). Blue sky sends a 400 for an expired token.
+	if postResp.StatusCode == http.StatusBadRequest {
 		fmt.Println("Access token expired. Attempting to refresh...")
-		
+
 		// Try to refresh the token
 		if config.BlueskySession.RefreshJwt != "" {
 			authResult, err := refreshBlueskyToken(config.BlueskySession.RefreshJwt)
 			if err != nil {
 				return fmt.Errorf("failed to refresh token: %w, please re-authenticate with 'auth bluesky'", err)
 			}
-			
+
 			// Update the tokens in config
 			config.BlueskySession.AccessJwt = authResult.AccessJwt
 			config.BlueskySession.RefreshJwt = authResult.RefreshJwt
-			
+
 			// Save the updated tokens
-			if err := SaveConfig(config); err != nil {
+			if err := saveConfig(config); err != nil {
 				return fmt.Errorf("failed to save refreshed tokens: %w", err)
 			}
-			
+
 			// Try posting again with the new token
 			return PostToBluesky(message)
 		}
-		
+
 		return fmt.Errorf("token expired and no refresh token available, please re-authenticate with 'auth bluesky'")
 	}
 
@@ -308,7 +301,7 @@ func PostToBluesky(message string) error {
 		bodyBytes, _ := io.ReadAll(postResp.Body)
 		return fmt.Errorf("posting failed: status %d, response: %s", postResp.StatusCode, string(bodyBytes))
 	}
-	
+
 	fmt.Println("Successfully posted to Bluesky!")
 	return nil
 }
@@ -351,6 +344,18 @@ func main() {
 		}
 
 		message := os.Args[2]
+
+		// Check message length against the character limit using Unicode character count
+		messageLength := utf8.RuneCountInString(message)
+		fmt.Printf("Your message contains %d characters (limit: %d)\n", messageLength, BlueskeyCharacterLimit)
+
+		// Is it too long?
+		if messageLength > BlueskeyCharacterLimit {
+			remainingCount := messageLength - BlueskeyCharacterLimit
+			fmt.Println(fmt.Errorf("message exceeds Bluesky's %d character limit by %d characters. Your message has %d characters. Please shorten your message", BlueskeyCharacterLimit, remainingCount, messageLength))
+			os.Exit(1)
+		}
+
 		if err := PostToBluesky(message); err != nil {
 			fmt.Printf("Error posting to Bluesky: %v\n", err)
 			os.Exit(1)
